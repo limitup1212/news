@@ -1,0 +1,39 @@
+name: News bulletin
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"  # every 30 minutes (GitHub may start runs late)
+  workflow_dispatch:  # adds a "Run workflow" button on the Actions tab
+
+# Never run two bulletins at once
+concurrency:
+  group: news-bulletin
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # to save state.json back to the repository
+
+jobs:
+  bulletin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python news_bulletin.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TZ: Asia/Beirut  # time spoken in the bulletin
+      - name: Remember the stories sent
+        # also after a failure: if one site was down, the other site's stories were still sent
+        if: ${{ !cancelled() && hashFiles('state.json') != '' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || { git commit -m "Update stories sent" && git push; }

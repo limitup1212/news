@@ -1,0 +1,10 @@
+{
+  "telegram_bot_token": "PUT_YOUR_BOT_TOKEN_HERE",
+  "telegram_chat_id": "PUT_YOUR_CHAT_ID_HERE",
+  "minutes": 60,
+  "voice": "ar-SA-HamedNeural",
+  "max_items": 60,
+  "max_chars_per_item": 700,
+  "send_when_empty": false,
+  "output_dir": "output"
+}

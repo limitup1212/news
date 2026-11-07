@@ -1,0 +1,16 @@
+# Secrets: never commit the real config
+config.json
+
+# Generated files
+output/
+news.log
+*.mp3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Previous versions, kept locally only
+old_versions/
