@@ -27,7 +27,7 @@ GitHub Actions checks for free every 30 minutes, so no computer has to stay on. 
 
 ## Good to know
 
-- **National News Agency stories are short.** Its pages only offer the headline and a short summary, so those stories are read as a headline, plus the summary when it is a complete sentence. Elnashra stories are read with up to 700 characters of the article.
+- **National News Agency stories are headlines only.** NNA's website blocks GitHub's servers, so its headlines come from the public Telegram channel [@NNA_Leb](https://t.me/s/NNA_Leb), which copies NNA's posts on X. That channel is run by a third party, not by NNA, and could stop at any time. Elnashra stories are read with up to 700 characters of the article.
 - **The same event can appear twice.** Both sites often cover the same news, and the bulletin doesn't remove these repeats.
 - **A red run on the Actions tab means a site failed.** The other site's stories are still sent, and the failed site is tried again on the next run.
 - **Keep the repository public.** Actions minutes are free for public repositories. A private one has a monthly limit that this schedule can use up.

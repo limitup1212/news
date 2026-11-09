@@ -23,7 +23,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 
 import edge_tts
@@ -37,7 +37,10 @@ STATE_PATH = BASE_DIR / "state.json"
 HEADERS = {"User-Agent": "personal-news-bulletin/1.0"}
 ELNASHRA_HOME = "https://www.elnashra.com/"
 ELNASHRA_SITEMAP = "https://www.elnashra.com/sitemap.xml"
-NNA_SITEMAP = "https://nna-leb.gov.lb/ar/sitemap/news.xml"
+# NNA's own site blocks GitHub's servers, so its headlines come from this public channel,
+# which copies the agency's posts on X (@NNALeb). It is run by a third party, not by NNA.
+NNA_CHANNEL = "https://t.me/s/NNA_Leb"
+NNA_PAGES = 4  # 20 posts per page; enough to catch up after a few hours of missed runs
 REQUEST_DELAY = 1.0  # seconds between requests to a site
 STATE_SIZE = 1500  # story ids to remember per source; must be more than a sitemap lists
 TELEGRAM_MAX_BYTES = 45 * 1024 * 1024  # Telegram bots can send up to 50 MB per file
@@ -70,8 +73,10 @@ class NewsItem:
 @dataclass
 class Source:
     name: str  # as read out in the bulletin
-    find: Callable[[], dict[int, tuple[str, float | None]]]  # {id: (url, unix time if known)}
-    read: Callable[[str, int], tuple[str, str]]  # (page html, max chars) -> (headline, text)
+    # {id: (url, unix time if known, headline if already known)}
+    find: Callable[[], dict[int, tuple[str, float | None, str]]]
+    # (page html, max chars) -> (headline, text); used when find gave no headline
+    read: Callable[[str, int], tuple[str, str]] | None
 
 
 def log(msg: str) -> None:
@@ -82,8 +87,10 @@ def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
-    cfg["telegram_bot_token"] = os.environ.get("TELEGRAM_BOT_TOKEN", cfg["telegram_bot_token"])
-    cfg["telegram_chat_id"] = os.environ.get("TELEGRAM_CHAT_ID", cfg["telegram_chat_id"])
+    for key in ("telegram_bot_token", "telegram_chat_id"):
+        value = os.environ.get(key.upper(), cfg[key])
+        # pasted secrets often carry spaces, quotes or a trailing newline
+        cfg[key] = str(value).strip().strip("\"'").strip()
     return cfg
 
 
@@ -115,7 +122,7 @@ def fetch(url: str) -> str:
     return r.text
 
 
-def elnashra_stories() -> dict[int, tuple[str, float | None]]:
+def elnashra_stories() -> dict[int, tuple[str, float | None, str]]:
     """The homepage is always up to date. The sitemap can lag behind it, but reaches far
     enough back to catch up after missed runs."""
     soup = BeautifulSoup(fetch(ELNASHRA_HOME), "html.parser")
@@ -123,7 +130,7 @@ def elnashra_stories() -> dict[int, tuple[str, float | None]]:
     for story in soup.select("li.newsfeed-main[data-id][data-timestamp]"):
         link = story.select_one("a[href*='/news/show/']")
         if link:
-            home[int(story["data-id"])] = (link["href"], float(story["data-timestamp"]))
+            home[int(story["data-id"])] = (link["href"], float(story["data-timestamp"]), "")
     if not home:
         raise RuntimeError("no stories found on the Elnashra homepage; the layout may have changed")
     try:
@@ -131,38 +138,41 @@ def elnashra_stories() -> dict[int, tuple[str, float | None]]:
     except requests.RequestException as e:
         log(f"could not read the Elnashra sitemap, using the homepage only: {e}")
         return home
-    older = {int(story_id): (url, None) for url, story_id in
+    older = {int(story_id): (url, None, "") for url, story_id in
              re.findall(r"<loc>(https://www\.elnashra\.com/news/show/(\d+)/[^<]*)</loc>", xml)}
     return {**older, **home}
 
 
-def nna_stories() -> dict[int, tuple[str, float | None]]:
-    """The sitemap has one list per category and per day. Its feed at /ar/rss has stopped
-    updating, and its /api/ path is off limits in robots.txt."""
-    entry = re.compile(r"<loc>([^<]+)</loc>\s*<lastmod>(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)")
-    now = datetime.now(timezone.utc)
+def nna_headline(post) -> str:
+    """The post text without its links and the date line the copying service adds."""
+    text = post.select_one(".tgme_widget_message_text")
+    if not text:
+        return ""
+    for br in text.find_all("br"):
+        br.replace_with(" ")
+    words = clean_text(text.get_text(" "))
+    words = re.sub(r"https?://\S+", " ", words)
+    words = re.sub(r"\b[A-Z][a-z]+ \d{1,2}, \d{4} at \d{1,2}:\d\d[AP]M\b", " ", words)
+    return clean_text(words)
 
-    def unix_time(lastmod: str) -> float:
-        # the site labels these times +02:00, but they are really UTC
-        return datetime.fromisoformat(lastmod).replace(tzinfo=timezone.utc).timestamp()
 
-    # daily lists are named by Lebanese date, which is ahead of UTC
-    today = now + timedelta(hours=3)
-    days = [f"{today:%Y-%m-%d}", f"{today - timedelta(days=1):%Y-%m-%d}"]
+def nna_stories() -> dict[int, tuple[str, float | None, str]]:
     stories = {}
-    categories = entry.findall(fetch(NNA_SITEMAP))
-    if not categories:
-        raise RuntimeError("no categories found in the NNA sitemap; the layout may have changed")
-    for url, lastmod in categories:
-        if unix_time(lastmod) < now.timestamp() - 3 * 86400:
-            continue  # nothing new in this category, so skip its requests
-        category = url.rsplit("/", 1)[-1]
-        for day in days:
-            xml = fetch(f"https://nna-leb.gov.lb/ar/sitemap/n/{category}?date={day}")
-            for story_url, story_time in entry.findall(xml):
-                m = re.search(r"/news/(\d+)", story_url)
-                if m:
-                    stories[int(m.group(1))] = (story_url, unix_time(story_time))
+    url = NNA_CHANNEL
+    for _ in range(NNA_PAGES):
+        soup = BeautifulSoup(fetch(url), "html.parser")
+        posts = soup.select("div.tgme_widget_message[data-post]")
+        for post in posts:
+            post_id = int(post["data-post"].rsplit("/", 1)[-1])
+            when = post.select_one("time[datetime]")
+            stories[post_id] = (f"https://t.me/{post['data-post']}",
+                                datetime.fromisoformat(when["datetime"]).timestamp() if when else None,
+                                nna_headline(post))
+        if not posts:
+            break
+        url = f"{NNA_CHANNEL}?before={min(stories)}"  # the next, older page
+    if not stories:
+        raise RuntimeError("no posts found on the NNA Telegram channel; it may have moved")
     return stories
 
 
@@ -186,16 +196,6 @@ def meta_text(soup: BeautifulSoup, name: str) -> str:
     return clean_text(meta["content"]) if meta and meta.get("content") else ""
 
 
-def read_nna(page: str, max_chars: int) -> tuple[str, str]:
-    """NNA pages only hold a summary cut off at about 100 characters; the full text is
-    loaded from its API. The summary is read only when it is a complete sentence."""
-    soup = BeautifulSoup(page, "html.parser")
-    if not soup.find("meta", property="article:published_time"):
-        return "", ""  # a missing story shows the homepage instead of an error
-    summary = re.sub(r"^وطنية\s*-\s*", "", meta_text(soup, "og:description"))
-    return meta_text(soup, "og:title"), trim(summary, max_chars) if summary.endswith((".", "؟", "!")) else ""
-
-
 def read_elnashra(page: str, max_chars: int) -> tuple[str, str]:
     soup = BeautifulSoup(page, "html.parser")
     title = meta_text(soup, "og:title")
@@ -214,22 +214,26 @@ def read_elnashra(page: str, max_chars: int) -> tuple[str, str]:
 
 SOURCES = {
     "elnashra": Source("النشرة", elnashra_stories, read_elnashra),
-    "nna": Source("الوكالة الوطنية للإعلام", nna_stories, read_nna),
+    "nna": Source("الوكالة الوطنية للإعلام", nna_stories, None),
 }
 
 
-def open_stories(source: Source, urls: dict[int, str], max_chars: int) -> tuple[list[NewsItem], set[int]]:
-    """Read each article. Returns the stories, and the ids of deleted ones to stop trying."""
+def open_stories(source: Source, wanted: dict[int, tuple[str, str]], max_chars: int) -> tuple[list[NewsItem], set[int]]:
+    """Read each article whose headline is not known yet. Returns the stories, and the ids
+    of deleted or empty ones to stop trying."""
     items, gone = [], set()
-    for story_id, url in sorted(urls.items()):
-        try:
-            title, body = source.read(fetch(url), max_chars)
-        except requests.RequestException as e:
-            if getattr(e.response, "status_code", None) == 404:
-                gone.add(story_id)
-            # any other failure is tried again on the next run
-            log(f"  could not open story {story_id}: {e}")
-            continue
+    for story_id, (url, known_title) in sorted(wanted.items()):
+        if known_title or source.read is None:
+            title, body = known_title, ""
+        else:
+            try:
+                title, body = source.read(fetch(url), max_chars)
+            except requests.RequestException as e:
+                if getattr(e.response, "status_code", None) == 404:
+                    gone.add(story_id)
+                # any other failure is tried again on the next run
+                log(f"  could not open story {story_id}: {e}")
+                continue
         if title:
             items.append(NewsItem(id=story_id, url=url, title=title, source=source.name, body=body))
         else:
@@ -244,9 +248,9 @@ def collect(source: Source, sent: set[int] | None, cfg: dict, minutes: int | Non
     window = minutes or (cfg["minutes"] if sent is None else None)
     if window:
         cutoff = time.time() - window * 60
-        wanted = {i: url for i, (url, when) in stories.items() if when is not None and when >= cutoff}
+        wanted = {i: (url, title) for i, (url, when, title) in stories.items() if when is not None and when >= cutoff}
     else:
-        wanted = {i: url for i, (url, _) in stories.items() if i not in sent}
+        wanted = {i: (url, title) for i, (url, _, title) in stories.items() if i not in sent}
     if sent is None:  # everything older than the first bulletin counts as already sent
         sent = set(stories) - set(wanted)
     if cfg["max_items"] and len(wanted) > cfg["max_items"]:
